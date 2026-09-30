@@ -1,0 +1,77 @@
+name: uptime
+# foil.ink 외부 가동 감시. 5분마다(깃허브 스케줄은 몇 분 늦을 수 있다).
+# - API 는 200 이 아니라 {"status":"ok","db":"ok"} 를 조건으로 본다 — 프로세스는 살고 DB 만 죽은 상태를 잡는다.
+# - 매 호출이 DB 를 찔러 Supabase 무료 플랜의 7일 무활동 자동정지도 막는다.
+# - 실패가 20초 뒤 재시도에도 이어지면 'outage' 이슈를 연다(이미 열려 있으면 그대로). 회복되면 댓글 달고 닫는다.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "알림 경로 시험: 실패를 흉내 낸다"
+        type: boolean
+        default: false
+permissions:
+  issues: write
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: probe
+        id: probe
+        env:
+          SIMULATE: ${{ inputs.simulate_failure }}
+        run: |
+          probe() {
+            local fails=""
+            api=$(curl -sS -m 15 https://api.foil.ink/health || echo "curl-error")
+            echo "$api" | grep -q '"status":"ok"' && echo "$api" | grep -q '"db":"ok"' || fails="$fails api(${api:0:120})"
+            fe=$(curl -sS -o /dev/null -m 20 -w '%{http_code}' https://foil.ink/ || echo "000")
+            [ "$fe" = "200" ] || fails="$fails web($fe)"
+            [ "$SIMULATE" = "true" ] && fails="$fails simulated"
+            echo "$fails"
+          }
+          f=$(probe)
+          if [ -n "$f" ]; then sleep 20; f=$(probe); fi
+          echo "fails=$f" >> "$GITHUB_OUTPUT"
+          if [ -n "$f" ]; then echo "::warning::DOWN:$f"; else echo "UP"; fi
+      - name: alert or recover
+        uses: actions/github-script@v7
+        env:
+          FAILS: ${{ steps.probe.outputs.fails }}
+        with:
+          script: |
+            const fails = (process.env.FAILS || '').trim();
+            const { owner, repo } = context.repo;
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: 'outage', per_page: 1 });
+            const issue = open.data[0];
+            const now = new Date().toISOString();
+            if (fails) {
+              if (!issue) {
+                await github.rest.issues.create({
+                  owner, repo, labels: ['outage'], assignees: [owner],
+                  title: `foil.ink 장애 감지 ${now.slice(0, 16).replace('T', ' ')} UTC`,
+                  body: `실패 항목: ${fails}\n\n20초 뒤 재시도에도 실패. 회복되면 이 이슈가 자동으로 닫힌다.\n실행: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                });
+              }
+            } else if (issue) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: `회복 확인 ${now}` });
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
+            }
+  keepalive:
+    # 공개 저장소는 60일간 커밋이 없으면 스케줄이 꺼진다 — 매달 1일 한 번 빈 커밋을 남긴다.
+    if: github.event_name == 'schedule' && github.event.schedule == '*/5 * * * *'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ "$(date -u +%d%H%M | cut -c1-4)" = "0100" ] || exit 0
+          git config user.name github-actions && git config user.email github-actions@users.noreply.github.com
+          git commit --allow-empty -m "keepalive $(date -u +%F)" && git push
