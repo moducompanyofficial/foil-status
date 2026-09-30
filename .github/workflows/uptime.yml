@@ -6,6 +6,7 @@ name: uptime
 on:
   schedule:
     - cron: "*/5 * * * *"
+    - cron: "17 0 1 * *"
   workflow_dispatch:
     inputs:
       simulate_failure:
@@ -19,6 +20,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   check:
+    if: github.event_name != 'schedule' || github.event.schedule == '*/5 * * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
@@ -65,13 +67,12 @@ jobs:
             }
   keepalive:
     # 공개 저장소는 60일간 커밋이 없으면 스케줄이 꺼진다 — 매달 1일 한 번 빈 커밋을 남긴다.
-    if: github.event_name == 'schedule' && github.event.schedule == '*/5 * * * *'
+    if: github.event_name == 'schedule' && github.event.schedule == '17 0 1 * *'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
       - run: |
-          [ "$(date -u +%d%H%M | cut -c1-4)" = "0100" ] || exit 0
           git config user.name github-actions && git config user.email github-actions@users.noreply.github.com
           git commit --allow-empty -m "keepalive $(date -u +%F)" && git push
